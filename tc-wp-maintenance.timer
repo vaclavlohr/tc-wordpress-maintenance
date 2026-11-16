@@ -1,0 +1,11 @@
+[Unit]
+Description=TC PEF automatic WordPress maintenance
+
+[Timer]
+OnCalendar=*-*-* 04:35:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=tc-wp-maintenance.service
+
+[Install]
+WantedBy=timers.target
