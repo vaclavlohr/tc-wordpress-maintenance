@@ -1,0 +1,10 @@
+# Never commit production state, credentials, or WordPress backups
+*.sql
+*.sql.gz
+*.log
+*.pem
+*.key
+.env
+wp-config.php
+backups/
+logs/
