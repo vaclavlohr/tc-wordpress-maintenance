@@ -1,0 +1,10 @@
+[Unit]
+Description=TC PEF WordPress updates (core, plugins, themes, translations, rollback, mail)
+Wants=network-online.target
+After=network-online.target mariadb.service php-fpm.service httpd.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/tc-wp-maintenance --run
+TimeoutStartSec=45min
