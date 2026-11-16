@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# TC PEF WordPress maintenance: backups, update, rollback, mail report.
+set -Eeuo pipefail
+umask 077
+
+MODE="${1:---check}"
+WP_ROOT=/var/www/wp
+BACKUP_ROOT=/var/backups/tc-wordpress/maintenance
+WPDEPLOY_TMP=/var/lib/wpdeploy/backups
+HOST=tc.pef.czu.cz
+MAIL_TO='tc@pef.czu.cz, lohr@pef.czu.cz'
+MAIL_FROM='tc-wp-updates@tc.pef.czu.cz'
+# Custom plugin is managed separately. Wordfence and SoSeRe receive updates.
+PLUGIN_EXCLUDE='tc-pef-plugin'
+AUTH_SENSITIVE_PLUGINS='wordfence social-semantic-recommendation-sosere'
+SENDMAIL=/usr/sbin/sendmail
+CORE_UPDATER=/usr/local/sbin/tc-wp-core-updater
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+SNAP="$BACKUP_ROOT/$RUN_ID"
+LOG="/var/log/tc-wp-maintenance-$RUN_ID.log"
+TMP_SQL="$WPDEPLOY_TMP/.tc-wp-maintenance-$RUN_ID.sql"
+MUTATING=0
+SNAP_READY=0
+ROLLED_BACK=0
+ROLLBACK_FAILED=0
+SENSITIVE_UPDATED=0
+SENSITIVE_PENDING=''
+
+[[ $EUID -eq 0 ]] || { echo 'ERROR: Run as root.' >&2; exit 1; }
+[[ "$MODE" == '--check' || "$MODE" == '--run' || "$MODE" == '--mail-test' ]] || {
+    echo 'Usage: tc-wp-maintenance --check|--run|--mail-test' >&2; exit 2;
+}
+
+send_report() {
+    local subject="$1" content="$2"
+    [[ -x "$SENDMAIL" ]] || { echo "ERROR: $SENDMAIL missing" >&2; return 1; }
+    {
+        printf 'To: %s\n' "$MAIL_TO"
+        printf 'From: TC WordPress updater <%s>\n' "$MAIL_FROM"
+        printf 'Subject: %s\n' "$subject"
+        printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\n'
+        printf 'Content-Transfer-Encoding: 8bit\n\n'
+        printf '%s\n' "$content"
+    } | "$SENDMAIL" -t -oi
+}
+
+if [[ "$MODE" == '--mail-test' ]]; then
+    send_report '[TC WordPress] TEST e-mailu' "Test mailoveho dorucovani z $(hostname -f) v $(date -Is). Prijemci: $MAIL_TO. Odeslani sendmailem samo o sobe nepotvrzuje doruceni do schranky."
+    echo 'Test message passed to sendmail. Verify both recipient inboxes and mail logs.'
+    exit 0
+fi
+
+mkdir -p /var/log
+exec 3>&1 4>&2
+: > "$LOG"
+chmod 600 "$LOG"
+exec >>"$LOG" 2>&1
+
+wp() {
+    runuser -u wpdeploy -- /usr/local/bin/wp --path="$WP_ROOT" --skip-plugins --skip-themes "$@"
+}
+
+probe() {
+    local path="$1" status
+    status="$(curl -sS -L --max-redirs 3 --connect-timeout 5 --max-time 25 \
+        --resolve "$HOST:443:127.0.0.1" -o /dev/null -w '%{http_code}' \
+        "https://$HOST$path")" || return 1
+    [[ "$status" =~ ^[1234][0-9][0-9]$ ]] || return 1
+    printf '%s' "$status"
+}
+
+rollback() {
+    echo '=== AUTOMATIC ROLLBACK ==='
+    [[ -d "$SNAP/files" && -s "$SNAP/wordpress.sql" ]] || {
+        echo 'ERROR: Backup is incomplete, rollback impossible.'
+        return 1
+    }
+    # Restore code, config, plugins, themes, languages. Preserve mutable app data.
+    rsync -aHAX --numeric-ids --delete \
+       --exclude='/.maintenance' \
+       --exclude='/wp-content/uploads/***' \
+       --exclude='/wp-content/wflogs/***' \
+       --exclude='/wp-content/litespeed/***' \
+       --exclude='/wp-content/cache/***' \
+       --exclude='/wp-content/upgrade/***' \
+       --exclude='/wp-content/upgrade-temp-backup/***' \
+       "$SNAP/files/" "$WP_ROOT/" || return 1
+    # Database has unrelated applications; only tc_wp_ tables were exported.
+    install -o wpdeploy -g wpdeploy -m 600 "$SNAP/wordpress.sql" "$TMP_SQL" || return 1
+    wp db import "$TMP_SQL" || return 1
+    rm -f "$TMP_SQL"
+    systemctl reload php-fpm || return 1
+    echo 'Rollback of WordPress code and its database tables completed.'
+}
+
+finish() {
+    local rc="$1" title='OK' mail_rc=0
+    trap - EXIT ERR INT TERM
+    set +e
+    if (( rc != 0 && MUTATING == 1 )); then
+        if (( SNAP_READY == 1 )); then
+            rollback
+            if (( $? == 0 )); then
+                ROLLED_BACK=1
+                echo 'Rollback result: SUCCESS (check login/2FA manually).'
+            else
+                ROLLBACK_FAILED=1
+                echo 'CRITICAL: ROLLBACK FAILED. Manual intervention needed.'
+            fi
+        else
+            ROLLBACK_FAILED=1
+            echo 'CRITICAL: No verified rollback snapshot.'
+        fi
+    fi
+    if (( MUTATING == 1 )); then
+        # WP-CLI normally manages maintenance mode. Remove only if update left it behind.
+        if [[ -e "$WP_ROOT/.maintenance" && ! -e "$SNAP/files/.maintenance" ]]; then
+            rm -f -- "$WP_ROOT/.maintenance"
+            echo 'Removed stale .maintenance file.'
+        fi
+    fi
+    rm -f -- "$TMP_SQL"
+    if (( rc != 0 )); then
+        title='ERROR'
+        (( ROLLED_BACK == 1 )) && title='ERROR - ROLLBACK OK'
+        (( ROLLBACK_FAILED == 1 )) && title='CRITICAL - ROLLBACK FAILED'
+    fi
+    {
+        echo "Completed: $(date -Is)"
+        echo "Exit code: $rc"
+        echo "Rollback completed: $ROLLED_BACK"
+        echo "Backup: $SNAP"
+        echo "Log: $LOG"
+    } >> "$LOG"
+    # Report every check and run (success, no updates, failure, rollback).
+    if (( rc == 0 && SENSITIVE_UPDATED == 1 )); then
+        title='OK - CHECK 2FA/SoSeRe'
+    fi
+    send_report "[TC WordPress] $title ($MODE) - $HOST" "$(cat "$LOG")" || mail_rc=1
+    cat "$LOG" >&3
+    if (( mail_rc != 0 )); then
+        echo 'ERROR: Could not submit report to sendmail.' >&4
+        (( rc == 0 )) && rc=8
+    fi
+    exit "$rc"
+}
+trap 'finish $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Only one updater of this generation at a time.
+exec 9>/run/lock/tc-wp-maintenance.lock
+flock -n 9 || { echo 'ERROR: Another maintenance run is active.'; exit 9; }
+
+for tool in /usr/local/bin/wp /usr/bin/rsync /usr/bin/curl /usr/bin/flock "$CORE_UPDATER"; do
+    [[ -x "$tool" ]] || { echo "ERROR: Missing executable: $tool"; exit 2; }
+done
+[[ -x "$SENDMAIL" ]] || { echo "ERROR: Missing mail transport: $SENDMAIL"; exit 2; }
+[[ -d "$WP_ROOT" && -d "$WPDEPLOY_TMP" ]] || {
+    echo 'ERROR: WordPress or deployment backup directory missing.'; exit 2;
+}
+[[ ! -e "$WP_ROOT/.maintenance" ]] || {
+    echo 'ERROR: WordPress is already in maintenance mode; do not overlap updates.'; exit 2;
+}
+[[ ! -f "$WP_ROOT/wp-content/object-cache.php" ]] || {
+    echo 'ERROR: Unexpected object-cache.php. Do not re-enable Redis until login issue is resolved.'; exit 2;
+}
+grep -Eq "define\([[:space:]]*['\"]WP_REDIS_DISABLED['\"][[:space:]]*,[[:space:]]*true" "$WP_ROOT/wp-config.php" || {
+    echo 'ERROR: WP_REDIS_DISABLED must stay true due to previous 2FA incident.'; exit 2;
+}
+
+cd "$WP_ROOT"
+echo "Start: $(date -Is)"
+echo "Mode: $MODE"
+echo '=== WordPress current version ==='
+wp core version
+
+# Verify expected DB scope before any backup or upgrade.
+PREFIX="$(wp db prefix)"
+[[ "$PREFIX" == 'tc_wp_' ]] || { echo "ERROR: Unexpected DB prefix $PREFIX"; exit 2; }
+TABLES="$(wp db tables --all-tables-with-prefix --format=csv)"
+[[ -n "$TABLES" ]] || { echo 'ERROR: No WordPress tables.'; exit 2; }
+IFS=',' read -ra TABLE_ARRAY <<< "$TABLES"
+for t in "${TABLE_ARRAY[@]}"; do
+    [[ "$t" =~ ^tc_wp_[[:alnum:]_]+$ ]] || { echo "ERROR: Unexpected DB table: $t"; exit 2; }
+done
+
+echo '=== Core minor updates ==='
+wp core check-update --minor || exit 1
+echo '=== Plugin updates (including Wordfence and SoSeRe) ==='
+wp plugin update --all --exclude="$PLUGIN_EXCLUDE" --dry-run || exit 1
+echo '=== Updates held for manual review (custom plugin only) ==='
+wp plugin list --update=available --fields=name,version,update_version --format=table | grep -E '(^name|tc-pef-plugin)' || true
+# Record whether updates are pending for plugins requiring post-update user verification.
+PENDING_PLUGINS="$(wp plugin list --update=available --field=name)" || exit 1
+for plugin in $AUTH_SENSITIVE_PLUGINS; do
+    if printf '%s\n' "$PENDING_PLUGINS" | grep -Fxq "$plugin"; then
+        SENSITIVE_PENDING="${SENSITIVE_PENDING:+$SENSITIVE_PENDING,}$plugin"
+    fi
+done
+if [[ -n "$SENSITIVE_PENDING" ]]; then
+    echo "NOTE: Sensitive plugin update pending: $SENSITIVE_PENDING"
+    echo 'IMPORTANT: Verify a real WordPress login + 2FA and SoSeRe recommendations after this run.'
+fi
+echo '=== Theme updates ==='
+wp theme update --all --dry-run || exit 1
+echo '=== Translation update preview ==='
+wp language core update --dry-run || exit 1
+wp language plugin update --all --dry-run || exit 1
+wp language theme update --all --dry-run || exit 1
+
+if [[ "$MODE" == '--check' ]]; then
+    echo 'Preflight passed. No changes were made.'
+    exit 0
+fi
+
+# Baseline site response codes; returns 5xx/000 fail.
+BEFORE_HOME="$(probe '/')" || { echo 'ERROR: Baseline homepage unavailable.'; exit 1; }
+BEFORE_REST="$(probe '/wp-json/')" || { echo 'ERROR: Baseline REST unavailable.'; exit 1; }
+BEFORE_LOGIN="$(probe '/wp/wp-login.php')" || { echo 'ERROR: Baseline login page unavailable.'; exit 1; }
+BEFORE_ADMIN_COUNT="$(wp user list --role=administrator --format=count)" || exit 1
+[[ "$BEFORE_ADMIN_COUNT" =~ ^[0-9]+$ && "$BEFORE_ADMIN_COUNT" -gt 0 ]] || {
+    echo 'ERROR: No WordPress administrators visible.'; exit 1;
+}
+BEFORE_ACTIVE="$(wp plugin list --status=active --field=name | LC_ALL=C sort)" || exit 1
+
+# Ensure enough free disk space for an update snapshot (in MB).
+FREE_MB="$(df -Pm "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')" || true
+if [[ -z "$FREE_MB" ]]; then
+    mkdir -p -m 700 "$BACKUP_ROOT"
+    FREE_MB="$(df -Pm "$BACKUP_ROOT" | awk 'NR==2 {print $4}')"
+fi
+[[ "$FREE_MB" =~ ^[0-9]+$ && "$FREE_MB" -ge 1500 ]] || {
+    echo "ERROR: Insufficient space for backup ($FREE_MB MB free)."; exit 1;
+}
+mkdir -p -m 700 "$SNAP/files"
+chmod 700 "$BACKUP_ROOT" "$SNAP"
+echo '=== Backup WordPress files (excluding volatile data) ==='
+rsync -aHAX --numeric-ids \
+    --exclude='/.maintenance' \
+    --exclude='/wp-content/uploads/***' \
+    --exclude='/wp-content/wflogs/***' \
+    --exclude='/wp-content/litespeed/***' \
+    --exclude='/wp-content/cache/***' \
+    --exclude='/wp-content/upgrade/***' \
+    --exclude='/wp-content/upgrade-temp-backup/***' \
+    "$WP_ROOT/" "$SNAP/files/"
+
+echo '=== Consistent backup of WordPress-prefixed DB tables ==='
+wp db export "$TMP_SQL" --tables="$TABLES" --single-transaction --quick
+[[ -s "$TMP_SQL" ]] || { echo 'ERROR: DB backup empty.'; exit 1; }
+mv -- "$TMP_SQL" "$SNAP/wordpress.sql"
+chmod 600 "$SNAP/wordpress.sql"
+SNAP_READY=1
+
+echo '=== Run updates ==='
+MUTATING=1
+# The established core updater has its own checksum and backup checks.
+"$CORE_UPDATER" --run
+wp plugin update --all --exclude="$PLUGIN_EXCLUDE"
+# Compare versions for sensitive plugins. A pending update alone is not evidence of change.
+for plugin in $AUTH_SENSITIVE_PLUGINS; do
+    if printf '%s\n' "$SENSITIVE_PENDING" | tr ',' '\n' | grep -Fxq "$plugin"; then
+        SENSITIVE_UPDATED=1
+        echo "NOTICE: Update attempted for $plugin - interactive functional verification required."
+    fi
+done
+wp theme update --all
+wp language core update
+wp language plugin update --all
+wp language theme update --all
+systemctl reload php-fpm
+
+# Smoke tests. These cannot validate an actual 2FA login; manual verification remains needed.
+echo '=== Verification ==='
+wp core is-installed
+wp core verify-checksums --exclude=readme.html,wp-includes/.htaccess
+AFTER_ADMIN_COUNT="$(wp user list --role=administrator --format=count)"
+AFTER_ACTIVE="$(wp plugin list --status=active --field=name | LC_ALL=C sort)"
+[[ "$AFTER_ADMIN_COUNT" == "$BEFORE_ADMIN_COUNT" ]] || {
+    echo "ERROR: Admin count changed ($BEFORE_ADMIN_COUNT to $AFTER_ADMIN_COUNT)."; exit 1;
+}
+[[ "$AFTER_ACTIVE" == "$BEFORE_ACTIVE" ]] || {
+    echo 'ERROR: Active plugin list changed unexpectedly.'; exit 1;
+}
+AFTER_HOME="$(probe '/')" && AFTER_REST="$(probe '/wp-json/')" && AFTER_LOGIN="$(probe '/wp/wp-login.php')" || {
+    echo 'ERROR: Web smoke test failed.'; exit 1;
+}
+[[ "$AFTER_HOME" == "$BEFORE_HOME" && "$AFTER_REST" == "$BEFORE_REST" && "$AFTER_LOGIN" == "$BEFORE_LOGIN" ]] || {
+    echo "ERROR: HTTP codes changed: home $BEFORE_HOME/$AFTER_HOME, REST $BEFORE_REST/$AFTER_REST, login $BEFORE_LOGIN/$AFTER_LOGIN"; exit 1;
+}
+echo "HTTP OK: home=$AFTER_HOME REST=$AFTER_REST login=$AFTER_LOGIN"
+[[ ! -e "$WP_ROOT/wp-content/object-cache.php" ]] || {
+    echo 'ERROR: Unexpected object-cache.php created during updates.'; exit 1;
+}
+if (( SENSITIVE_UPDATED == 1 )); then
+    echo 'ACTION REQUIRED: After Wordfence/SoSeRe updates, manually test WordPress login, real 2FA, and personalized content.'
+fi
+echo 'LIMITATION: HTTP and WP-CLI checks cannot prove a successful interactive 2FA login.'
+
+# Keep only 3 latest successful snapshots and any failed one (failure exits earlier).
+mapfile -t OLD_SNAPS < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%f\n' | LC_ALL=C sort -r)
+for ((i=3; i<${#OLD_SNAPS[@]}; i++)); do
+    rm -rf -- "$BACKUP_ROOT/${OLD_SNAPS[i]}"
+done
+
+echo 'All updates and tests succeeded.'
