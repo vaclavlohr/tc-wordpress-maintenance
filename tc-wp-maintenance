@@ -297,15 +297,18 @@ MUTATING=1
 wp plugin update --all --exclude="$PLUGIN_EXCLUDE"
 # Compare versions for sensitive plugins. A pending update alone is not evidence of change.
 for plugin in $AUTH_SENSITIVE_PLUGINS; do
-    if printf '%s\n' "$SENSITIVE_PENDING" | tr ',' '\n' | grep -Fxq "$plugin"; then
+    if [[ " $SENSITIVE_PENDING " == *" $plugin "* ]]; then
         SENSITIVE_UPDATED=1
         echo "NOTICE: Update attempted for $plugin - interactive functional verification required."
     fi
 done
 wp theme update --all
-wp language core update
-wp language plugin update --all
-wp language theme update --all
+# Record real translation updates for the human-readable report.
+: > "$STATE_DIR/translations.log"
+wp language core update 2>&1 | tee -a "$STATE_DIR/translations.log"
+wp language plugin update --all 2>&1 | tee -a "$STATE_DIR/translations.log"
+wp language theme update --all 2>&1 | tee -a "$STATE_DIR/translations.log"
+TRANSLATIONS_UPDATED="$(grep -ci 'Translation updated successfully' "$STATE_DIR/translations.log" || true)"
 systemctl reload php-fpm
 
 # Smoke tests. These cannot validate an actual 2FA login; manual verification remains needed.
@@ -335,10 +338,34 @@ if (( SENSITIVE_UPDATED == 1 )); then
 fi
 echo 'LIMITATION: HTTP and WP-CLI checks cannot prove a successful interactive 2FA login.'
 
-# Keep only 3 latest successful snapshots and any failed one (failure exits earlier).
-mapfile -t OLD_SNAPS < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%f\n' | LC_ALL=C sort -r)
-for ((i=3; i<${#OLD_SNAPS[@]}; i++)); do
-    rm -rf -- "$BACKUP_ROOT/${OLD_SNAPS[i]}"
-done
+# Capture actual installed versions for e-mail (not merely update candidates).
+wp core version > "$STATE_DIR/core-after"
+wp plugin list --fields=name,version,update,update_version --format=json > "$STATE_DIR/plugins-after.json"
+wp theme list --fields=name,version,update,update_version --format=json > "$STATE_DIR/themes-after.json"
 
+DIFF="$(python3 - "$STATE_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+def txt(name):
+    return (p / name).read_text(encoding="utf-8").strip()
+changed = txt("core-before") != txt("core-after")
+for kind in ("plugins", "themes"):
+    old = {x["name"]: x.get("version") for x in json.loads(txt(kind + "-before.json"))}
+    new = {x["name"]: x.get("version") for x in json.loads(txt(kind + "-after.json"))}
+    changed = changed or any(new.get(k) != v for k, v in old.items() if k in new)
+print(1 if changed else 0)
+PY
+)" || exit 1
+if [[ "$DIFF" == '1' ]] || (( TRANSLATIONS_UPDATED > 0 )); then
+    CHANGES_APPLIED=1
+fi
+
+# The update is verified: retention errors must not trigger a production rollback.
+MUTATING=0
+python3 "$PRUNE_SCRIPT" "$BACKUP_ROOT" || {
+    echo 'ERROR: Backup retention failed; the installed updates were not rolled back.'
+    exit 1
+}
 echo 'All updates and tests succeeded.'
