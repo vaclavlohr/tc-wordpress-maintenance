@@ -47,7 +47,7 @@ send_report() {
     local code="$1" backup=''
     (( SNAP_READY == 1 )) && backup="$SNAP"
     python3 "$MAIL_REPORT" \
-        --mode "$MODE" --result "$code" \
+        --mode="$MODE" --result "$code" \
         --updated "$CHANGES_APPLIED" --pending "$PENDING_UPDATES" \
         --translations "$TRANSLATIONS_UPDATED" --sensitive "$SENSITIVE_UPDATED" \
         --rollback "$ROLLED_BACK" --rollback-failed "$ROLLBACK_FAILED" \
@@ -124,6 +124,10 @@ finish() {
         fi
     fi
     rm -f -- "$TMP_SQL"
+    # Enforce retention after a failed update as well; keep the newest incident snapshot.
+    if (( rc != 0 && SNAP_READY == 1 )); then
+        python3 "$PRUNE_SCRIPT" "$BACKUP_ROOT" || echo 'WARNING: Failed to prune backup snapshots.'
+    fi
     if (( rc != 0 )); then
         title='ERROR'
         (( ROLLED_BACK == 1 )) && title='ERROR - ROLLBACK OK'
