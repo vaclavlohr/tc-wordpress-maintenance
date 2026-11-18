@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+import importlib.util
+import json
+import tempfile
+import unittest
+from datetime import date, timedelta
+from email import policy
+from email.parser import BytesParser
+from pathlib import Path
+from unittest import mock
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+class MaintenanceTests(unittest.TestCase):
+    def test_html_mail_report(self):
+        mod = load("tc-wp-mail-report.py", "tc_mail")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mod.subprocess, "run") as run:
+            state = Path(tmp)
+            (state / "plugins-before.json").write_text(json.dumps([
+                {"name":"elementor","version":"4.4.0", "update":"available", "update_version":"4.4.1"}]))
+            (state / "plugins-after.json").write_text(json.dumps([
+                {"name":"elementor","version":"4.4.1", "update":"none"}]))
+            (state / "themes-before.json").write_text("[]")
+            (state / "themes-after.json").write_text("[]")
+            (state / "core-before").write_text("7.1.4")
+            (state / "core-after").write_text("7.1.4")
+            with mock.patch.object(sys, "argv", [
+                "tc-wp-mail-report.py", "--mode=--run", "--result=0",
+                "--updated=1", "--translations=2", "--state", str(state)
+            ]):
+                mod.main()
+            self.assertEqual(run.call_count, 1)
+            message = BytesParser(policy=policy.default).parsebytes(run.call_args.kwargs["input"])
+            self.assertIn("Elementor", message.get_body(preferencelist=("html",)).get_content().title())
+            self.assertIn("4.4.1", message.get_body(preferencelist=("html",)).get_content())
+            self.assertIn("2 jazykových", message.get_body(preferencelist=("html",)).get_content())
+            self.assertTrue(message.get_body(preferencelist=("plain",)))
+    def test_six_month_ten_snapshot_policy(self):
+        mod = load("tc-wp-prune-backups.py", "tc_prune")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp)
+            stamp = date.today().strftime("%Y%m%d")
+            for i in range(12):
+                (p / f"{stamp}-040000-{1000+i}").mkdir()
+            older = date.today().replace(year=date.today().year - 1)
+            (p / f"{older.strftime('%Y%m%d')}-030000-13").mkdir()
+            (p / "other-snapshot").mkdir()
+            mod.main(tmp)
+            candidates = [n for n in p.iterdir() if n.name.startswith(stamp)]
+            self.assertEqual(len(candidates), 10)
+            self.assertTrue((p / "other-snapshot").exists())
+            self.assertFalse((p / f"{older.strftime('%Y%m%d')}-030000-13").exists())
+
+if __name__ == "__main__":
+    unittest.main()
