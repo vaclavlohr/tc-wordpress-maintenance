@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 [[ $EUID -eq 0 ]] || { echo 'ERROR: Run as root (sudo).' >&2; exit 1; }
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-for f in tc-wp-maintenance install.sh; do
+for f in tc-wp-maintenance install.sh update-server.sh update-from-github.sh; do
     bash -n "$DIR/$f"
 done
 if systemctl is-active --quiet tc-wp-maintenance.service; then
@@ -17,6 +17,12 @@ for file in /usr/local/sbin/tc-wp-maintenance \
             /etc/systemd/system/tc-wp-maintenance.service \
             /etc/systemd/system/tc-wp-maintenance.timer; do
     [[ -f "$file" ]] && cp -a -- "$file" "$SAFE_DIR/"
+done
+# Python helper scripts are part of the same deployment and do not contain secrets.
+python3 -m py_compile "$DIR/tc-wp-mail-report.py" "$DIR/tc-wp-prune-backups.py"
+for script in tc-wp-mail-report.py tc-wp-prune-backups.py; do
+    [[ -f "/usr/local/sbin/$script" ]] && cp -a -- "/usr/local/sbin/$script" "$SAFE_DIR/"
+    install -o root -g root -m 750 "$DIR/$script" "/usr/local/sbin/$script"
 done
 install -o root -g root -m 750 "$DIR/tc-wp-maintenance" /usr/local/sbin/tc-wp-maintenance
 install -o root -g root -m 644 "$DIR/tc-wp-maintenance.service" /etc/systemd/system/tc-wp-maintenance.service
