@@ -13,7 +13,8 @@ MAIL_FROM='tc-wp-updates@tc.pef.czu.cz'
 # Custom plugin is managed separately. Wordfence and SoSeRe receive updates.
 PLUGIN_EXCLUDE='tc-pef-plugin'
 AUTH_SENSITIVE_PLUGINS='wordfence social-semantic-recommendation-sosere'
-SENDMAIL=/usr/sbin/sendmail
+MAIL_REPORT=/usr/local/sbin/tc-wp-mail-report.py
+PRUNE_SCRIPT=/usr/local/sbin/tc-wp-prune-backups.py
 CORE_UPDATER=/usr/local/sbin/tc-wp-core-updater
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 SNAP="$BACKUP_ROOT/$RUN_ID"
@@ -25,31 +26,34 @@ ROLLED_BACK=0
 ROLLBACK_FAILED=0
 SENSITIVE_UPDATED=0
 SENSITIVE_PENDING=''
+PENDING_UPDATES=0
+CHANGES_APPLIED=0
+TRANSLATIONS_UPDATED=0
+START_TS="$(date -Is)"
+STATE_DIR=''
 
 [[ $EUID -eq 0 ]] || { echo 'ERROR: Run as root.' >&2; exit 1; }
 [[ "$MODE" == '--check' || "$MODE" == '--run' || "$MODE" == '--mail-test' ]] || {
     echo 'Usage: tc-wp-maintenance --check|--run|--mail-test' >&2; exit 2;
 }
 
-send_report() {
-    local subject="$1" content="$2"
-    [[ -x "$SENDMAIL" ]] || { echo "ERROR: $SENDMAIL missing" >&2; return 1; }
-    {
-        printf 'To: %s\n' "$MAIL_TO"
-        printf 'From: TC WordPress updater <%s>\n' "$MAIL_FROM"
-        printf 'Subject: %s\n' "$subject"
-        printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\n'
-        printf 'Content-Transfer-Encoding: 8bit\n\n'
-        printf '%s\n' "$content"
-    } | "$SENDMAIL" -t -oi
-}
-
 if [[ "$MODE" == '--mail-test' ]]; then
-    send_report '[TC WordPress] TEST e-mailu' "Test mailoveho dorucovani z $(hostname -f) v $(date -Is). Prijemci: $MAIL_TO. Odeslani sendmailem samo o sobe nepotvrzuje doruceni do schranky."
-    echo 'Test message passed to sendmail. Verify both recipient inboxes and mail logs.'
+    python3 "$MAIL_REPORT" --mail-test
+    echo 'Test report submitted to sendmail.'
     exit 0
 fi
-
+STATE_DIR="$(mktemp -d /run/tc-wp-maintenance.XXXXXXXX)"
+send_report() {
+    local code="$1" backup=''
+    (( SNAP_READY == 1 )) && backup="$SNAP"
+    python3 "$MAIL_REPORT" \
+        --mode "$MODE" --result "$code" \
+        --updated "$CHANGES_APPLIED" --pending "$PENDING_UPDATES" \
+        --translations "$TRANSLATIONS_UPDATED" --sensitive "$SENSITIVE_UPDATED" \
+        --rollback "$ROLLED_BACK" --rollback-failed "$ROLLBACK_FAILED" \
+        --start "$START_TS" --end "$(date -Is)" \
+        --log "$LOG" --backup "$backup" --state "$STATE_DIR"
+}
 mkdir -p /var/log
 exec 3>&1 4>&2
 : > "$LOG"
@@ -57,7 +61,7 @@ chmod 600 "$LOG"
 exec >>"$LOG" 2>&1
 
 wp() {
-    runuser -u wpdeploy -- /usr/local/bin/wp --path="$WP_ROOT" --skip-plugins --skip-themes "$@"
+    runuser -u wpdeploy -- /usr/local/bin/wp --no-color --path="$WP_ROOT" --skip-plugins --skip-themes "$@"
 }
 
 probe() {
@@ -132,14 +136,16 @@ finish() {
         echo "Backup: $SNAP"
         echo "Log: $LOG"
     } >> "$LOG"
-    # Report every check and run (success, no updates, failure, rollback).
-    if (( rc == 0 && SENSITIVE_UPDATED == 1 )); then
-        title='OK - CHECK 2FA/SoSeRe'
+    # No update and no failure => no e-mail.
+    if (( rc != 0 || CHANGES_APPLIED == 1 )); then
+        send_report "$rc" || mail_rc=1
+    elif [[ "$MODE" == '--check' ]] && (( PENDING_UPDATES == 1 )); then
+        send_report "$rc" || mail_rc=1
     fi
-    send_report "[TC WordPress] $title ($MODE) - $HOST" "$(cat "$LOG")" || mail_rc=1
     cat "$LOG" >&3
+    rm -rf -- "$STATE_DIR"
     if (( mail_rc != 0 )); then
-        echo 'ERROR: Could not submit report to sendmail.' >&4
+        echo 'ERROR: Could not send the HTML report via sendmail.' >&4
         (( rc == 0 )) && rc=8
     fi
     exit "$rc"
@@ -152,7 +158,7 @@ trap 'exit 143' TERM
 exec 9>/run/lock/tc-wp-maintenance.lock
 flock -n 9 || { echo 'ERROR: Another maintenance run is active.'; exit 9; }
 
-for tool in /usr/local/bin/wp /usr/bin/rsync /usr/bin/curl /usr/bin/flock "$CORE_UPDATER"; do
+for tool in /usr/local/bin/wp /usr/bin/rsync /usr/bin/curl /usr/bin/flock "$CORE_UPDATER" "$MAIL_REPORT" "$PRUNE_SCRIPT"; do
     [[ -x "$tool" ]] || { echo "ERROR: Missing executable: $tool"; exit 2; }
 done
 [[ -x "$SENDMAIL" ]] || { echo "ERROR: Missing mail transport: $SENDMAIL"; exit 2; }
@@ -187,7 +193,7 @@ done
 
 echo '=== Core minor updates ==='
 wp core check-update --minor || exit 1
-echo '=== Plugin updates (including Wordfence and SoSeRe) ==='
+echo '=== Plugin updates ==='
 wp plugin update --all --exclude="$PLUGIN_EXCLUDE" --dry-run || exit 1
 echo '=== Updates held for manual review (custom plugin only) ==='
 wp plugin list --update=available --fields=name,version,update_version --format=table | grep -E '(^name|tc-pef-plugin)' || true
