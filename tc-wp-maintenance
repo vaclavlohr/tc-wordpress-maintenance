@@ -191,32 +191,63 @@ for t in "${TABLE_ARRAY[@]}"; do
     [[ "$t" =~ ^tc_wp_[[:alnum:]_]+$ ]] || { echo "ERROR: Unexpected DB table: $t"; exit 2; }
 done
 
+# Record versions to produce an exact before/after e-mail report.
+wp core version > "$STATE_DIR/core-before"
+wp plugin list --fields=name,version,update,update_version --format=json > "$STATE_DIR/plugins-before.json"
+wp theme list --fields=name,version,update,update_version --format=json > "$STATE_DIR/themes-before.json"
+
 echo '=== Core minor updates ==='
-wp core check-update --minor || exit 1
+CORE_COUNT="$(wp core check-update --minor --format=count)" || exit 1
+[[ "$CORE_COUNT" =~ ^[0-9]+$ ]] || { echo "ERROR: Invalid core update count: $CORE_COUNT"; exit 1; }
+if (( CORE_COUNT > 0 )); then
+    PENDING_UPDATES=1
+    echo "Available minor core updates: $CORE_COUNT"
+else
+    echo 'WordPress core is up to date.'
+fi
+
 echo '=== Plugin updates ==='
 wp plugin update --all --exclude="$PLUGIN_EXCLUDE" --dry-run || exit 1
-echo '=== Updates held for manual review (custom plugin only) ==='
-wp plugin list --update=available --fields=name,version,update_version --format=table | grep -E '(^name|tc-pef-plugin)' || true
-# Record whether updates are pending for plugins requiring post-update user verification.
 PENDING_PLUGINS="$(wp plugin list --update=available --field=name)" || exit 1
+for plugin in $PENDING_PLUGINS; do
+    [[ "$plugin" == "$PLUGIN_EXCLUDE" ]] || PENDING_UPDATES=1
+done
 for plugin in $AUTH_SENSITIVE_PLUGINS; do
     if printf '%s\n' "$PENDING_PLUGINS" | grep -Fxq "$plugin"; then
-        SENSITIVE_PENDING="${SENSITIVE_PENDING:+$SENSITIVE_PENDING,}$plugin"
+        SENSITIVE_PENDING="$SENSITIVE_PENDING $plugin"
     fi
 done
 if [[ -n "$SENSITIVE_PENDING" ]]; then
-    echo "NOTE: Sensitive plugin update pending: $SENSITIVE_PENDING"
-    echo 'IMPORTANT: Verify a real WordPress login + 2FA and SoSeRe recommendations after this run.'
+    echo "NOTE: Sensitive plugin update pending:$SENSITIVE_PENDING"
+    echo 'IMPORTANT: Verify real WordPress login + 2FA and SoSeRe recommendations after this run.'
 fi
+echo '=== Updates held for manual review (custom plugin only) ==='
+wp plugin list --update=available --fields=name,version,update_version --format=table | grep -E '(^name|tc-pef-plugin)' || true
+
 echo '=== Theme updates ==='
 wp theme update --all --dry-run || exit 1
+PENDING_THEMES="$(wp theme list --update=available --field=name)" || exit 1
+[[ -z "$PENDING_THEMES" ]] || PENDING_UPDATES=1
+
 echo '=== Translation update preview ==='
-wp language core update --dry-run || exit 1
-wp language plugin update --all --dry-run || exit 1
-wp language theme update --all --dry-run || exit 1
+LANG_CORE="$(wp language core update --dry-run 2>&1)" || { printf '%s\n' "$LANG_CORE"; exit 1; }
+LANG_PLUGINS="$(wp language plugin update --all --dry-run 2>&1)" || { printf '%s\n' "$LANG_PLUGINS"; exit 1; }
+LANG_THEMES="$(wp language theme update --all --dry-run 2>&1)" || { printf '%s\n' "$LANG_THEMES"; exit 1; }
+printf '%s\n' "$LANG_CORE" "$LANG_PLUGINS" "$LANG_THEMES"
+for preview in "$LANG_CORE" "$LANG_PLUGINS" "$LANG_THEMES"; do
+    if ! grep -qi 'Translations are up to date' <<< "$preview"; then
+        PENDING_UPDATES=1
+    fi
+done
 
 if [[ "$MODE" == '--check' ]]; then
     echo 'Preflight passed. No changes were made.'
+    exit 0
+fi
+
+if (( PENDING_UPDATES == 0 )); then
+    echo 'No updates available; no backup or e-mail needed.'
+    python3 "$PRUNE_SCRIPT" "$BACKUP_ROOT" || exit 1
     exit 0
 fi
 
