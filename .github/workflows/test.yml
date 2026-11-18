@@ -1,0 +1,21 @@
+name: Static checks and tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n tc-wp-maintenance
+          bash -n install.sh
+          bash -n update-server.sh
+          bash -n update-from-github.sh
+      - name: Python tests
+        run: |
+          python3 -m py_compile tc-wp-mail-report.py tc-wp-prune-backups.py
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
