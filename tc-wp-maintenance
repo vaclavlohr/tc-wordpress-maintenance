@@ -13,6 +13,7 @@ MAIL_FROM='tc-wp-updates@tc.pef.czu.cz'
 # Custom plugin is managed separately. Wordfence and SoSeRe receive updates.
 PLUGIN_EXCLUDE='tc-pef-plugin'
 AUTH_SENSITIVE_PLUGINS='wordfence social-semantic-recommendation-sosere'
+SENDMAIL=/usr/sbin/sendmail
 MAIL_REPORT=/usr/local/sbin/tc-wp-mail-report.py
 PRUNE_SCRIPT=/usr/local/sbin/tc-wp-prune-backups.py
 CORE_UPDATER=/usr/local/sbin/tc-wp-core-updater
