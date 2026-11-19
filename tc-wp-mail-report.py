@@ -13,6 +13,12 @@ from pathlib import Path
 TO = ("tc@pef.czu.cz", "lohr@pef.czu.cz")
 SENDER = "TC WordPress <tc-wp-updates@tc.pef.czu.cz>"
 HOST = "tc.pef.czu.cz"
+CONTACT_NAME = "Ing. Václav Lohr, Ph.D."
+CONTACT_ROLE = "vedoucí provozu Testovacího centra PEF, SIS PEF"
+CONTACT_ORG = "Provozně ekonomická fakulta ČZU v Praze"
+CONTACT_EMAIL = "lohr@pef.czu.cz"
+CONTACT_OFFICE_PHONE = "+420 224 382 054"
+CONTACT_MOBILE_PHONE = "+420 734 170 772"
 
 def file_text(path):
     try:
@@ -50,6 +56,7 @@ def send(subject, plain, rich):
     msg = EmailMessage()
     msg["To"] = ", ".join(TO)
     msg["From"] = SENDER
+    msg["Reply-To"] = CONTACT_EMAIL
     msg["Subject"] = subject
     msg.set_content(plain)
     msg.add_alternative(rich, subtype="html")
@@ -141,6 +148,19 @@ def main():
         meta += "<br><strong>Výsledek:</strong> {}<br><strong>Záloha:</strong> {}<br><strong>Log:</strong> {}".format(
             esc(outcome), esc(a.backup or "nevytvářena"), esc(a.log)
         )
+    signature_html = (
+        "<div style='border-top:1px solid #e2e8f0;margin-top:26px;padding-top:18px;"
+        "font-size:13px;color:#475569;line-height:1.7;'>"
+        "<strong style='color:#193452;font-size:14px;'>{}</strong><br>"
+        "{}<br>{}<br>"
+        "E-mail: <a href='mailto:{}' style='color:#2563eb;'>{}</a><br>"
+        "Telefon: {} &nbsp;|&nbsp; Mobil: {}"
+        "</div>"
+    ).format(
+        esc(CONTACT_NAME), esc(CONTACT_ROLE), esc(CONTACT_ORG),
+        esc(CONTACT_EMAIL), esc(CONTACT_EMAIL),
+        esc(CONTACT_OFFICE_PHONE), esc(CONTACT_MOBILE_PHONE)
+    )
     accent = "#b91c1c" if a.result else "#2563eb" if check else "#047857"
     rich = """<!doctype html><html lang="cs"><head><meta charset="utf-8"></head>
 <body style="margin:0;background:#f3f6fb;font-family:Arial,Helvetica,sans-serif;color:#243044;">
@@ -153,10 +173,11 @@ def main():
 <p style="font-size:16px;line-height:1.6;">{intro}</p>
 {changes}{notes}
 <div style="border-top:1px solid #e2e8f0;margin-top:26px;padding-top:18px;color:#64748b;font-size:13px;line-height:1.8;">{meta}</div>
+{signature}
 </div><div style="padding:16px 32px;background:#f1f5f9;color:#64748b;font-size:12px;">
 Automatická zpráva správce webu Testovacího centra PEF.</div></div></body></html>""".format(
         title=esc(title), accent=accent, outcome=esc(outcome), intro=esc(introduction),
-        changes=changes, notes=notes, meta=meta
+        changes=changes, notes=notes, meta=meta, signature=signature_html
     )
     plain_rows = "\n".join("{} {}: {} → {}".format(pretty.get(k,k), n, old, new) for k,n,old,new in rows)
     plain = "{}\n\n{}\n\n{}\nPřeklady: {}\n\nWeb: {}\nVýsledek: {}\nČas: {}\nZáloha: {}\nProtokol: {}\n".format(
@@ -167,6 +188,13 @@ Automatická zpráva správce webu Testovacího centra PEF.</div></div></body></
         plain += "\nOVĚŘIT: přihlášení s 2FA a personalizaci SoSeRe.\n"
     if a.result:
         plain += "\n" + re.sub(r"<[^>]+>", "", notes).replace("&gt;", ">").replace("&lt;", "<") + "\n"
+    plain += (
+        "\n---\n"
+        "{}\n{}\n{}\nE-mail: {}\nTelefon: {}\nMobil: {}\n"
+    ).format(
+        CONTACT_NAME, CONTACT_ROLE, CONTACT_ORG, CONTACT_EMAIL,
+        CONTACT_OFFICE_PHONE, CONTACT_MOBILE_PHONE
+    )
     send("[TC WordPress] {} – {}".format(title, HOST), plain, rich)
 
 if __name__ == "__main__":
