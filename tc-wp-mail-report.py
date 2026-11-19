@@ -72,7 +72,12 @@ def main():
         rows = []
     elif a.result != 0:
         title = "Údržba webu vyžaduje pozornost"
-        introduction = "Během aktualizací WordPressu byla zjištěna chyba."
+        if check:
+            introduction = "Při kontrole dostupných aktualizací nastala chyba. Žádné změny WordPressu se nespustily."
+        elif not a.backup and not a.rollback and not a.rollback_failed:
+            introduction = "Úvodní kontrola před aktualizací skončila chybou. Žádné aktualizace se nespustily."
+        else:
+            introduction = "Během údržby WordPressu byla zjištěna chyba."
         outcome = "CHYBA"
         rows = entries(state, "plugins", False) + entries(state, "themes", False)
     elif check:
@@ -116,15 +121,20 @@ def main():
                   "<strong>Po aktualizaci Wordfence nebo SoSeRe:</strong> "
                   "ověřte přihlášení včetně 2FA a správné fungování personalizace.</p>")
     if a.result:
-        result = ("Rollback proveden." if a.rollback else
+        result = ("Obnova ze zálohy proběhla; funkčnost webu je třeba ověřit." if a.rollback else
                   "Rollback se nezdařil – je nutný ruční zásah." if a.rollback_failed else
-                  "Aktualizace byla přerušena bez potvrzeného rollbacku.")
+                  "Aktualizace se nespustily a rollback nebyl potřeba." if check or not a.backup else
+                  "Běh skončil chybou. Ověřte stav podle protokolu.")
         notes += "<p style='background:#fef2f2;padding:14px;'>⚠️ <strong>{}</strong></p>".format(esc(result))
-        error_lines = [re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", line).strip()
-                       for line in file_text(a.log).splitlines()
-                       if re.search(r"\b(ERROR|CRITICAL|CHYBA):", line, flags=re.I)]
+        log_lines = [re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", line).strip()
+                     for line in file_text(a.log).splitlines() if line.strip()]
+        error_lines = [line for line in log_lines if re.search(
+            r"\b(ERROR|CRITICAL|CHYBA|failed|failure)\b|unbound variable|command not found|Traceback",
+            line, flags=re.I)]
         if error_lines:
-            notes += "<p style='color:#b91c1c;'>Poslední chyba: {}</p>".format(esc(error_lines[-1][:400]))
+            notes += "<p style='color:#b91c1c;'><strong>Příčina:</strong> {}</p>".format(esc(error_lines[-1][:500]))
+        elif log_lines:
+            notes += "<p style='color:#b91c1c;'><strong>Poslední výpis:</strong> {}</p>".format(esc(log_lines[-1][:500]))
     stamp = a.end or datetime.now().astimezone().isoformat(timespec="minutes")
     meta = "<strong>Web:</strong> {}<br><strong>Dokončeno:</strong> {}".format(esc(HOST), esc(stamp))
     if not a.mail_test:
@@ -155,6 +165,8 @@ Automatická zpráva správce webu Testovacího centra PEF.</div></div></body></
     )
     if a.sensitive:
         plain += "\nOVĚŘIT: přihlášení s 2FA a personalizaci SoSeRe.\n"
+    if a.result:
+        plain += "\n" + re.sub(r"<[^>]+>", "", notes).replace("&gt;", ">").replace("&lt;", "<") + "\n"
     send("[TC WordPress] {} – {}".format(title, HOST), plain, rich)
 
 if __name__ == "__main__":
