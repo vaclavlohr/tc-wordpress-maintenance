@@ -42,6 +42,26 @@ class MaintenanceTests(unittest.TestCase):
             self.assertIn("4.4.1", message.get_body(preferencelist=("html",)).get_content())
             self.assertIn("2 jazykových", message.get_body(preferencelist=("html",)).get_content())
             self.assertTrue(message.get_body(preferencelist=("plain",)))
+    def test_failed_preflight_explains_no_rollback_needed(self):
+        mod = load("tc-wp-mail-report.py", "tc_mail_error")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mod.subprocess, "run") as run:
+            log = Path(tmp) / "check.log"
+            log.write_text("tc-wp-maintenance: line 170: SENDMAIL: unbound variable\n")
+            with mock.patch.object(sys, "argv", [
+                "tc-wp-mail-report.py", "--mode=--check", "--result=1",
+                "--log", str(log), "--backup", ""
+            ]):
+                mod.main()
+            message = BytesParser(policy=policy.default).parsebytes(run.call_args.kwargs["input"])
+            body = message.get_body(preferencelist=("html",)).get_content()
+            self.assertIn("unbound variable", body)
+            self.assertIn("rollback nebyl potřeba", body)
+            self.assertIn("Žádné změny WordPressu se nespustily", body)
+    def test_sendmail_variable_defined_before_preflight(self):
+        shell = (ROOT / "tc-wp-maintenance").read_text(encoding="utf-8")
+        self.assertIn("SENDMAIL=/usr/sbin/sendmail", shell)
+        self.assertLess(shell.index("SENDMAIL=/usr/sbin/sendmail"), shell.index('[[ -x "$SENDMAIL" ]]'))
+
     def test_six_month_ten_snapshot_policy(self):
         mod = load("tc-wp-prune-backups.py", "tc_prune")
         with tempfile.TemporaryDirectory() as tmp:
