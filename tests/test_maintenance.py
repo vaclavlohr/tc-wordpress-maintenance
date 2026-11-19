@@ -42,6 +42,10 @@ class MaintenanceTests(unittest.TestCase):
             self.assertIn("4.4.1", message.get_body(preferencelist=("html",)).get_content())
             self.assertIn("2 jazykových", message.get_body(preferencelist=("html",)).get_content())
             self.assertTrue(message.get_body(preferencelist=("plain",)))
+            self.assertIn("Ing. Václav Lohr, Ph.D.", message.get_body(preferencelist=("html",)).get_content())
+            self.assertIn("Ing. Václav Lohr, Ph.D.", message.get_body(preferencelist=("plain",)).get_content())
+            self.assertIn("+420 734 170 772", message.get_body(preferencelist=("plain",)).get_content())
+            self.assertEqual(str(message["Reply-To"]), "lohr@pef.czu.cz")
     def test_failed_preflight_explains_no_rollback_needed(self):
         mod = load("tc-wp-mail-report.py", "tc_mail_error")
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mod.subprocess, "run") as run:
